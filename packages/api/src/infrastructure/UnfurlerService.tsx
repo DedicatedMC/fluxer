@@ -121,7 +121,7 @@ export class UnfurlerService extends IUnfurlerService {
 			return new Uint8Array(0);
 		}
 
-		const MAX_STREAM_BYTES = 500 * 1024 * 1024;
+		const MAX_STREAM_BYTES = 10 * 1024 * 1024;
 		const chunks: Array<Uint8Array> = [];
 		let totalSize = 0;
 		const reader = stream.getReader();

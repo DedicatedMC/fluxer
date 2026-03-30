@@ -53,6 +53,7 @@ build_config(Json) ->
         instance_domain => get_string(Federation, <<"instance_domain">>, "localhost"),
         instance_public_key => get_optional_binary(Federation, <<"instance_public_key">>),
         instance_private_key => get_optional_binary(Federation, <<"instance_private_key">>),
+        relay_auth_token => get_optional_binary(Service, <<"relay_auth_token">>),
         allowed_origins => get_string_list(Service, <<"allowed_origins">>, []),
         max_connections_per_instance => get_int(Service, <<"max_connections_per_instance">>, 1000),
         connection_timeout_ms => get_int(Service, <<"connection_timeout_ms">>, 30000),

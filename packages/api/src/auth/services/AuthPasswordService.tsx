@@ -162,8 +162,11 @@ export class AuthPasswordService {
 						statusText: response.statusText,
 						hashPrefix,
 					},
-					'Pwned Passwords API returned non-OK status',
+					'Pwned Passwords API returned non-OK status — allowing password (fail-open)',
 				);
+				// Fail-open per NIST SP 800-63B: do not block account creation/password
+				// reset when the breach check service is unavailable. Result is intentionally
+				// not cached so the next attempt will retry against the API.
 				return false;
 			}
 
@@ -200,7 +203,10 @@ export class AuthPasswordService {
 			pwnedPasswordCache.set(hashed, false);
 			return false;
 		} catch (error) {
-			Logger.error({error}, 'Failed to check password against Pwned Passwords API');
+			Logger.error({error}, 'Failed to check password against Pwned Passwords API — allowing password (fail-open)');
+			// Fail-open per NIST SP 800-63B: do not block account creation/password
+			// reset when the breach check service is unavailable. Result is intentionally
+			// not cached so the next attempt will retry against the API.
 			return false;
 		}
 	}

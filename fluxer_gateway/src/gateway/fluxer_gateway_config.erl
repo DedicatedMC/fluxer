@@ -50,6 +50,7 @@ build_config(Json) ->
     #{
         port => get_int(Service, <<"port">>, 8080),
         admin_reload_secret => get_optional_binary(Service, <<"admin_reload_secret">>),
+        relay_auth_token => get_optional_binary(Service, <<"relay_auth_token">>),
         nats_core_url => get_string(Nats, <<"core_url">>, "nats://127.0.0.1:4222"),
         nats_auth_token => get_string(Nats, <<"auth_token">>, ""),
         identify_rate_limit_enabled => get_bool(Service, <<"identify_rate_limit_enabled">>, false),

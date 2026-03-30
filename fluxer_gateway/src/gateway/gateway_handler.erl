@@ -72,22 +72,56 @@ new_state() ->
 -type ws_frame() :: {text, binary()} | {binary, binary()}.
 -type ws_result() :: {ok, state()} | {[ws_frame() | {close, integer(), binary()}], state()}.
 
--spec init(cowboy_req:req(), term()) -> {cowboy_websocket, cowboy_req:req(), state()}.
+-spec init(cowboy_req:req(), term()) -> {cowboy_websocket, cowboy_req:req(), state()} | {ok, cowboy_req:req(), state()}.
 init(Req, _Opts) ->
-    QS = cowboy_req:parse_qs(Req),
-    Version = parse_version(proplists:get_value(<<"v">>, QS)),
-    Encoding = gateway_codec:parse_encoding(proplists:get_value(<<"encoding">>, QS)),
-    Compression = gateway_compress:parse_compression(proplists:get_value(<<"compress">>, QS)),
-    CompressCtx = gateway_compress:new_context(Compression),
-    PeerIPBinary = extract_client_ip(Req),
-    State = new_state(),
-    {cowboy_websocket, Req, State#{
-        version => Version,
-        encoding => Encoding,
-        compress_ctx => CompressCtx,
-        socket_pid => self(),
-        peer_ip => PeerIPBinary
-    }}.
+    Headers = cowboy_req:headers(Req),
+    case validate_relay_headers(Headers) of
+        ok ->
+            QS = cowboy_req:parse_qs(Req),
+            Version = parse_version(proplists:get_value(<<"v">>, QS)),
+            Encoding = gateway_codec:parse_encoding(proplists:get_value(<<"encoding">>, QS)),
+            Compression = gateway_compress:parse_compression(proplists:get_value(<<"compress">>, QS)),
+            CompressCtx = gateway_compress:new_context(Compression),
+            PeerIPBinary = extract_client_ip(Req),
+            State = new_state(),
+            {cowboy_websocket, Req, State#{
+                version => Version,
+                encoding => Encoding,
+                compress_ctx => CompressCtx,
+                socket_pid => self(),
+                peer_ip => PeerIPBinary
+            }};
+        {error, Reason} ->
+            Req2 = cowboy_req:reply(403, #{<<"content-type">> => <<"text/plain">>}, Reason, Req),
+            {ok, Req2, new_state()}
+    end.
+
+-spec validate_relay_headers(map()) -> ok | {error, binary()}.
+validate_relay_headers(Headers) ->
+    case maps:get(<<"x-relay-proxied">>, Headers, undefined) of
+        <<"true">> ->
+            RelayToken = maps:get(<<"x-relay-token">>, Headers, undefined),
+            case RelayToken of
+                undefined ->
+                    {error, <<"Relay connection missing authentication token">>};
+                _ ->
+                    ExpectedToken = fluxer_gateway_env:get(relay_auth_token),
+                    case ExpectedToken of
+                        undefined ->
+                            {error, <<"Gateway not configured to accept relay connections">>};
+                        Expected when is_binary(Expected), byte_size(Expected) > 0 ->
+                            case byte_size(RelayToken) =:= byte_size(Expected) andalso
+                                 crypto:hash_equals(Expected, RelayToken) of
+                                true -> ok;
+                                false -> {error, <<"Invalid relay authentication token">>}
+                            end;
+                        _ ->
+                            {error, <<"Gateway not configured to accept relay connections">>}
+                    end
+            end;
+        _ ->
+            ok
+    end.
 
 -spec parse_version(binary() | undefined) -> 1 | undefined.
 parse_version(<<"1">>) -> 1;

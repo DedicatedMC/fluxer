@@ -85,7 +85,48 @@ validate_connection(State) ->
         {_, undefined} ->
             {error, <<"Missing relay_token parameter">>};
         {_, _} ->
-            ok
+            case validate_relay_token(RelayToken) of
+                ok ->
+                    case validate_origin(OriginInstance) of
+                        ok -> ok;
+                        {error, _} = OriginErr -> OriginErr
+                    end;
+                {error, _} = TokenErr ->
+                    TokenErr
+            end
+    end.
+
+-spec validate_relay_token(binary()) -> ok | {error, binary()}.
+validate_relay_token(Token) when is_binary(Token) ->
+    Config = fluxer_relay_env:get_map(),
+    ExpectedToken = maps:get(relay_auth_token, Config, undefined),
+    case ExpectedToken of
+        undefined ->
+            lager:warning("No relay_auth_token configured — rejecting connection"),
+            {error, <<"Relay authentication not configured">>};
+        Expected when is_binary(Expected), byte_size(Expected) > 0 ->
+            case byte_size(Token) =:= byte_size(Expected) andalso
+                 crypto:hash_equals(Expected, Token) of
+                true -> ok;
+                false -> {error, <<"Invalid relay token">>}
+            end;
+        _ ->
+            {error, <<"Relay authentication not configured">>}
+    end.
+
+-spec validate_origin(binary()) -> ok | {error, binary()}.
+validate_origin(Origin) when is_binary(Origin) ->
+    Config = fluxer_relay_env:get_map(),
+    AllowedOrigins = maps:get(allowed_origins, Config, []),
+    case AllowedOrigins of
+        [] ->
+            ok;
+        _ ->
+            OriginStr = binary_to_list(Origin),
+            case lists:member(OriginStr, AllowedOrigins) of
+                true -> ok;
+                false -> {error, <<"Origin not allowed">>}
+            end
     end.
 
 -spec websocket_handle({text | binary, binary()}, map()) -> {[{text | binary, binary()}], map()}.
