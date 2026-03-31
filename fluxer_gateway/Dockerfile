@@ -1,4 +1,4 @@
-FROM erlang:28-slim AS build
+FROM docker.io/erlang:28-slim AS build
 
 ARG LOGGER_LEVEL=info
 
@@ -25,7 +25,7 @@ COPY . .
 RUN LOGGER_LEVEL=${LOGGER_LEVEL} envsubst < config/sys.config.template > config/sys.config && \
 	rebar3 as prod release
 
-FROM erlang:28-slim
+FROM docker.io/erlang:28-slim
 
 WORKDIR /opt/fluxer_gateway
 

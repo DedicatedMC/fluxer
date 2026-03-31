@@ -34,6 +34,12 @@ export interface APIConfig {
 		sqlitePath: string;
 	};
 
+	tenant: {
+		enabled: boolean;
+		platformDomain: string;
+		defaultTenantId: string;
+	};
+
 	kv: {
 		url: string;
 		mode: 'standalone' | 'cluster';

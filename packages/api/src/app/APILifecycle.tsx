@@ -18,6 +18,7 @@
  */
 
 import {randomUUID} from 'node:crypto';
+import {createTenantID} from '@fluxer/api/src/BrandedTypes';
 import type {APIConfig} from '@fluxer/api/src/config/APIConfig';
 import {GuildDataRepository} from '@fluxer/api/src/guild/repositories/GuildDataRepository';
 import type {ILogger} from '@fluxer/api/src/ILogger';
@@ -42,12 +43,17 @@ import {JetStreamWorkerQueue} from '@fluxer/api/src/worker/JetStreamWorkerQueue'
 import {WorkerService} from '@fluxer/api/src/worker/WorkerService';
 import {JetStreamConnectionManager} from '@fluxer/nats/src/JetStreamConnectionManager';
 import {NatsConnectionManager} from '@fluxer/nats/src/NatsConnectionManager';
+import {TenantContext} from '@fluxer/api/src/tenant/TenantContext';
 
 let natsRpcListener: NatsApiRpcListener | null = null;
 let jsConnectionManager: JetStreamConnectionManager | null = null;
 
 export function createInitializer(config: APIConfig, logger: ILogger): () => Promise<void> {
 	return async (): Promise<void> => {
+		// Run initialization in the default tenant scope so that any database
+		// queries issued during startup have a valid tenant context.
+		const defaultTenantId = createTenantID(BigInt(config.tenant.defaultTenantId));
+		return TenantContext.run(defaultTenantId, async () => {
 		logger.info('Initializing API service...');
 
 		const kvClient = getKVClient();
@@ -166,6 +172,7 @@ export function createInitializer(config: APIConfig, logger: ILogger): () => Pro
 		}
 
 		logger.info('API service initialization complete');
+		});
 	};
 }
 

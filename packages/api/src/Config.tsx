@@ -138,6 +138,12 @@ export function buildAPIConfigFromMaster(master: MasterConfig): APIConfig {
 			sqlitePath: master.database.sqlite_path,
 		},
 
+		tenant: {
+			enabled: (master as {tenant?: {enabled?: boolean}}).tenant?.enabled ?? false,
+			platformDomain: (master as {tenant?: {platform_domain?: string}}).tenant?.platform_domain ?? '',
+			defaultTenantId: (master as {tenant?: {default_tenant_id?: string}}).tenant?.default_tenant_id ?? '1',
+		},
+
 		kv: {
 			url: master.internal.kv,
 			mode: ((master.internal as {kv_mode?: string}).kv_mode ?? 'standalone') as 'standalone' | 'cluster',

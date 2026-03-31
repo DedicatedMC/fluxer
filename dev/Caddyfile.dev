@@ -1,9 +1,11 @@
 {
-	auto_https off
 	admin off
+	http_port 48780
 }
 
-:48763 {
+localhost:48763 {
+	tls internal
+
 	handle /_caddy_health {
 		respond "OK" 200
 	}

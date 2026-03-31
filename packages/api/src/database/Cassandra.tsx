@@ -21,6 +21,7 @@ import crypto from 'node:crypto';
 import {Config} from '@fluxer/api/src/Config';
 import {encodeKey, getKvStore} from '@fluxer/api/src/database/SqliteKV';
 import {Logger} from '@fluxer/api/src/Logger';
+import {TenantContext} from '@fluxer/api/src/tenant/TenantContext';
 import {recordCounter, recordHistogram} from '@fluxer/telemetry/src/Metrics';
 import cassandra from 'cassandra-driver';
 import {z} from 'zod';
@@ -472,6 +473,24 @@ function assertNoUndefinedParams(params: Record<string, unknown>): void {
 	}
 }
 
+function ensureTenantParam<P extends CassandraParams>(cql: string, params: P): P {
+	if ((params as Record<string, unknown>).tenant_id === undefined && cql.includes(':tenant_id')) {
+		const tenantId = TenantContext.getOrNull();
+		if (tenantId !== null) {
+			return {...params, tenant_id: tenantId} as P;
+		}
+		// Fallback: use default tenant ID from config when no tenant context is active
+		// (e.g. during service initialization before TenantMiddleware runs).
+		try {
+			const fallbackTenantId = BigInt(Config.tenant.defaultTenantId);
+			return {...params, tenant_id: fallbackTenantId} as P;
+		} catch {
+			// Config not yet initialized
+		}
+	}
+	return params;
+}
+
 function normalizeExecuteArgs<P extends CassandraParams>(
 	queryOrPrepared: string | PreparedQuery<P>,
 	params?: P,
@@ -480,9 +499,10 @@ function normalizeExecuteArgs<P extends CassandraParams>(
 		if (!params) {
 			throw new Error('Missing params object for Cassandra query execution');
 		}
-		return {cql: queryOrPrepared, params};
+		return {cql: queryOrPrepared, params: ensureTenantParam(queryOrPrepared, params)};
 	}
-	return queryOrPrepared;
+	// Also inject for PreparedQuery objects (covers tenantPrepared and raw paths)
+	return {cql: queryOrPrepared.cql, params: ensureTenantParam(queryOrPrepared.cql, queryOrPrepared.params), kvMeta: queryOrPrepared.kvMeta};
 }
 
 function normalizeCqlForRegistry(cql: string): string {
@@ -1159,6 +1179,7 @@ export type WhereExpr<Row extends object> =
 	| {kind: 'lte'; col: ColumnName<Row>; param: string}
 	| {kind: 'gte'; col: ColumnName<Row>; param: string}
 	| {kind: 'tokenGt'; col: ColumnName<Row>; param: string}
+	| {kind: 'tokenGtMulti'; cols: ReadonlyArray<string>; params: ReadonlyArray<string>}
 	| {kind: 'tupleGt'; cols: ReadonlyArray<ColumnName<Row>>; params: ReadonlyArray<string>};
 
 export type OrderBy<Row extends object> = {col: ColumnName<Row>; direction?: 'ASC' | 'DESC'};
@@ -1249,6 +1270,7 @@ export interface Table<Row extends object, PK extends ColumnName<Row>, PartKey e
 		lte: <K extends ColumnName<Row>>(col: K, param?: string) => WhereExpr<Row>;
 		gte: <K extends ColumnName<Row>>(col: K, param?: string) => WhereExpr<Row>;
 		tokenGt: <K extends ColumnName<Row>>(col: K, param: string) => WhereExpr<Row>;
+		tokenGtMulti: (cols: ReadonlyArray<string>, params: ReadonlyArray<string>) => WhereExpr<Row>;
 		tupleGt: <K extends ColumnName<Row>>(cols: ReadonlyArray<K>, params: ReadonlyArray<string>) => WhereExpr<Row>;
 	};
 }
@@ -1269,6 +1291,11 @@ function compileWhere<Row extends object>(w: WhereExpr<Row>): string {
 			return `${w.col} >= :${w.param}`;
 		case 'tokenGt':
 			return `TOKEN(${w.col}) > TOKEN(:${w.param})`;
+		case 'tokenGtMulti': {
+			const tokenCols = w.cols.join(', ');
+			const tokenParams = w.params.map((p) => `:${p}`).join(', ');
+			return `TOKEN(${tokenCols}) > TOKEN(${tokenParams})`;
+		}
 		case 'tupleGt': {
 			if (w.cols.length !== w.params.length || w.cols.length === 0) {
 				throw new Error('tupleGt requires equal-length non-empty cols/params');
@@ -1293,18 +1320,32 @@ export function defineTable<Row extends object, PK extends ColumnName<Row>, Part
 	columns: ReadonlyArray<ColumnName<Row>>;
 	primaryKey: ReadonlyArray<PK>;
 	partitionKey?: ReadonlyArray<PartKey>;
+	tenantScoped?: boolean;
 }): Table<Row, PK, PartKey> {
 	const columns = [...def.columns];
 	const pk = [...def.primaryKey];
 	const partitionKey = [...(def.partitionKey ?? def.primaryKey)] as Array<PartKey>;
+	const isTenantScoped = def.tenantScoped !== false;
+
+	// Effective keys include tenant_id for CQL generation (tenant_id is NOT in the Row type)
+	const effectivePk = isTenantScoped ? ['tenant_id', ...pk] : [...pk];
+	const effectivePartitionKey = isTenantScoped ? ['tenant_id', ...partitionKey] : [...partitionKey];
+
 	const tableSpec: KvTableSpec<Row> = {
 		name: def.name,
 		columns,
-		primaryKey: pk as ReadonlyArray<ColumnName<Row>>,
-		partitionKey: partitionKey as ReadonlyArray<ColumnName<Row>>,
+		primaryKey: effectivePk as ReadonlyArray<ColumnName<Row>>,
+		partitionKey: effectivePartitionKey as ReadonlyArray<ColumnName<Row>>,
 	};
 
 	registerTableSpec(tableSpec);
+
+	function tenantPrepared<P extends CassandraParams>(cql: string, params: P, kvMeta?: KvQueryMeta): PreparedQuery<P> {
+		if (isTenantScoped) {
+			return prepared(cql, {...params, tenant_id: TenantContext.get()} as P, kvMeta);
+		}
+		return prepared(cql, params, kvMeta);
+	}
 
 	const nonPkColumns = columns.filter((c) => !pk.includes(c as PK)) as Array<Exclude<ColumnName<Row>, PK>>;
 
@@ -1316,13 +1357,16 @@ export function defineTable<Row extends object, PK extends ColumnName<Row>, Part
 		return [where as WhereExpr<Row>];
 	};
 
+	// For INSERT column lists, prepend tenant_id when tenant-scoped
+	const insertColumns = isTenantScoped ? ['tenant_id', ...columns] : [...columns];
+
 	const updateAll =
 		nonPkColumns.length > 0
 			? `UPDATE ${def.name}
 SET ${nonPkColumns.map((c) => `${c} = :${c}`).join(', ')}
-WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
+WHERE ${effectivePk.map((k) => `${k} = :${k}`).join(' AND ')};
 `
-			: `INSERT INTO ${def.name} (${columns.join(', ')}) VALUES (${columns.map((c) => `:${c}`).join(', ')});`;
+			: `INSERT INTO ${def.name} (${insertColumns.join(', ')}) VALUES (${insertColumns.map((c) => `:${c}`).join(', ')});`;
 	registerKvMeta(updateAll, {action: 'upsert', table: tableSpec} as KvQueryMeta<Record<string, unknown>>);
 
 	function paramsFromRow(row: Row, requireAll: boolean = true): CassandraParams {
@@ -1359,11 +1403,23 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 			nonPkColumns.length > 0
 				? `UPDATE ${def.name}
 SET ${nonPkColumns.map((c) => `${c} = :${c}`).join(', ')}
-WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
+WHERE ${effectivePk.map((k) => `${k} = :${k}`).join(' AND ')};
 `
-				: `INSERT INTO ${def.name} (${pk.join(', ')}) VALUES (${pk.map((c) => `:${c}`).join(', ')});`;
+				: `INSERT INTO ${def.name} (${(isTenantScoped ? ['tenant_id', ...pk] : pk).join(', ')}) VALUES (${(isTenantScoped ? ['tenant_id', ...pk] : pk).map((c) => `:${c}`).join(', ')});`;
 
 		return {cql, params};
+	}
+
+	const tenantWherePrefix = isTenantScoped ? 'tenant_id = :tenant_id' : null;
+
+	function buildWhereClause(userWhere?: WhereExpr<Row> | ReadonlyArray<WhereExpr<Row>>): string {
+		const parts: Array<string> = [];
+		if (tenantWherePrefix) parts.push(tenantWherePrefix);
+		if (userWhere) {
+			const clauses = Array.isArray(userWhere) ? userWhere : [userWhere];
+			for (const c of clauses) parts.push(compileWhere<Row>(c));
+		}
+		return parts.length > 0 ? ` WHERE ${parts.join(' AND ')}` : '';
 	}
 
 	function selectCql(
@@ -1375,14 +1431,7 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 		} = {},
 	): string {
 		const selectCols = (opts.columns ?? columns).join(', ');
-
-		let where = '';
-		if (opts.where) {
-			const clauses = Array.isArray(opts.where) ? opts.where : [opts.where];
-			if (clauses.length > 0) {
-				where = ` WHERE ${clauses.map((c) => compileWhere<Row>(c)).join(' AND ')}`;
-			}
-		}
+		const where = buildWhereClause(opts.where);
 
 		const orderBy = opts.orderBy != null ? ` ORDER BY ${opts.orderBy.col} ${opts.orderBy.direction ?? 'ASC'}` : '';
 		const limit = typeof opts.limit === 'number' ? ` LIMIT ${opts.limit}` : '';
@@ -1420,7 +1469,7 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 		return {
 			cql,
 			bind(params: CassandraParams) {
-				return prepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
+				return tenantPrepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
 			},
 		};
 	}
@@ -1438,7 +1487,7 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 
 		const cql = `UPDATE ${def.name}
 SET ${patchKeys.map((c) => `${c} = :${c}`).join(', ')}
-WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
+WHERE ${effectivePk.map((k) => `${k} = :${k}`).join(' AND ')};
 `;
 
 		const params: CassandraParams = {};
@@ -1453,10 +1502,10 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 			pkColumns: pk,
 		};
 
-		return prepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
+		return tenantPrepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
 	}
 
-	const deleteByPkCql = `DELETE FROM ${def.name} WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};`;
+	const deleteByPkCql = `DELETE FROM ${def.name} WHERE ${effectivePk.map((k) => `${k} = :${k}`).join(' AND ')};`;
 	registerKvMeta(deleteByPkCql, {
 		action: 'delete',
 		table: tableSpec,
@@ -1464,14 +1513,11 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 	} as KvQueryMeta<Record<string, unknown>>);
 
 	function deleteCql(opts: {where?: WhereExpr<Row> | ReadonlyArray<WhereExpr<Row>>} = {}): string {
-		let where = '';
+		let where: string;
 		if (opts.where) {
-			const clauses = Array.isArray(opts.where) ? opts.where : [opts.where];
-			if (clauses.length > 0) {
-				where = ` WHERE ${clauses.map((c) => compileWhere<Row>(c)).join(' AND ')}`;
-			}
+			where = buildWhereClause(opts.where);
 		} else {
-			where = ` WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')}`;
+			where = ` WHERE ${effectivePk.map((k) => `${k} = :${k}`).join(' AND ')}`;
 		}
 		const cql = `DELETE FROM ${def.name}${where};`;
 		registerKvMeta(cql, {
@@ -1492,7 +1538,7 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 		return {
 			cql,
 			bind(params: CassandraParams) {
-				return prepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
+				return tenantPrepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
 			},
 		};
 	}
@@ -1505,14 +1551,14 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 			table: tableSpec,
 			where: pk.map((col) => ({kind: 'eq', col, param: col})) as ReadonlyArray<WhereExpr<Row>>,
 		};
-		return prepared(deleteByPkCql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
+		return tenantPrepared(deleteByPkCql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
 	}
 
 	function deletePartition(partKeyValues: Pick<Row, PartKey>): PreparedQuery {
 		if (partitionKey.length === 0) {
 			throw new Error(`Table "${def.name}" has empty partitionKey; cannot deletePartition()`);
 		}
-		const cql = `DELETE FROM ${def.name} WHERE ${partitionKey.map((k) => `${k} = :${k}`).join(' AND ')};`;
+		const cql = `DELETE FROM ${def.name} WHERE ${effectivePartitionKey.map((k) => `${k} = :${k}`).join(' AND ')};`;
 		const params: CassandraParams = {};
 		for (const k of partitionKey) params[k] = (partKeyValues as Record<string, CassandraParam>)[k];
 		const kvMeta: KvQueryMeta<Row> = {
@@ -1520,10 +1566,10 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 			table: tableSpec,
 			where: partitionKey.map((col) => ({kind: 'eq', col, param: col})) as ReadonlyArray<WhereExpr<Row>>,
 		};
-		return prepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
+		return tenantPrepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
 	}
 
-	const insertBaseCql = `INSERT INTO ${def.name} (${columns.join(', ')}) VALUES (${columns.map((c) => `:${c}`).join(', ')})`;
+	const insertBaseCql = `INSERT INTO ${def.name} (${insertColumns.join(', ')}) VALUES (${insertColumns.map((c) => `:${c}`).join(', ')})`;
 
 	function insertCql(opts: {ttlParam?: string} = {}): string {
 		const cql = opts.ttlParam ? `${insertBaseCql} USING TTL :${opts.ttlParam};` : `${insertBaseCql};`;
@@ -1535,14 +1581,14 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 	function insert(row: Row): PreparedQuery {
 		const params = paramsFromRow(row);
 		const kvMeta: KvQueryMeta<Row> = {action: 'upsert', table: tableSpec};
-		return prepared(`${insertBaseCql};`, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
+		return tenantPrepared(`${insertBaseCql};`, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
 	}
 
 	function insertWithTtl(row: Row, ttlSeconds: number): PreparedQuery {
 		const cql = `${insertBaseCql} USING TTL ${ttlSeconds};`;
 		const params = paramsFromRow(row);
 		const kvMeta: KvQueryMeta<Row> = {action: 'upsert', table: tableSpec, ttlSeconds};
-		return prepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
+		return tenantPrepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
 	}
 
 	function insertWithTtlParam(row: Row, ttlParamName: string): PreparedQuery {
@@ -1552,24 +1598,18 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 			params[ttlParamName] = row[ttlParamName as keyof Row] as CassandraParam;
 		}
 		const kvMeta: KvQueryMeta<Row> = {action: 'upsert', table: tableSpec, ttlParamName};
-		return prepared(cql, params as CassandraParams, kvMeta as KvQueryMeta<Record<string, unknown>>);
+		return tenantPrepared(cql, params as CassandraParams, kvMeta as KvQueryMeta<Record<string, unknown>>);
 	}
 
 	function insertIfNotExists(row: Row): PreparedQuery {
 		const cql = `${insertBaseCql} IF NOT EXISTS;`;
 		const params = paramsFromRow(row);
 		const kvMeta: KvQueryMeta<Row> = {action: 'insertIfNotExists', table: tableSpec};
-		return prepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
+		return tenantPrepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
 	}
 
 	function selectCountCql(opts: {where?: WhereExpr<Row> | ReadonlyArray<WhereExpr<Row>>} = {}): string {
-		let where = '';
-		if (opts.where) {
-			const clauses = Array.isArray(opts.where) ? opts.where : [opts.where];
-			if (clauses.length > 0) {
-				where = ` WHERE ${clauses.map((c) => compileWhere<Row>(c)).join(' AND ')}`;
-			}
-		}
+		const where = buildWhereClause(opts.where);
 		const cql = `SELECT COUNT(*) as count FROM ${def.name}${where};`;
 		registerKvMeta(cql, {
 			action: 'count',
@@ -1589,15 +1629,17 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 		return {
 			cql,
 			bind(params: CassandraParams) {
-				return prepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
+				return tenantPrepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
 			},
 		};
 	}
 
 	function insertWithNow<NowCol extends ColumnName<Row>>(row: Omit<Row, NowCol>, nowColumn: NowCol): PreparedQuery {
 		const otherColumns = columns.filter((c) => c !== nowColumn);
-		const allCols = [...otherColumns, nowColumn];
-		const values = otherColumns.map((c) => `:${c}`).concat(['now()']);
+		const allColsBase = [...otherColumns, nowColumn];
+		const allCols = isTenantScoped ? ['tenant_id', ...allColsBase] : allColsBase;
+		const valuesBase = otherColumns.map((c) => `:${c}`).concat(['now()']);
+		const values = isTenantScoped ? [':tenant_id', ...valuesBase] : valuesBase;
 		const cql = `INSERT INTO ${def.name} (${allCols.join(', ')}) VALUES (${values.join(', ')});`;
 
 		const params: CassandraParams = {};
@@ -1614,7 +1656,7 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 			table: tableSpec,
 			nowColumn: nowColumn as ColumnName<Row>,
 		};
-		return prepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
+		return tenantPrepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
 	}
 
 	function patchByPkWithTtl(
@@ -1631,7 +1673,7 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 
 		const cql = `UPDATE ${def.name} USING TTL ${ttlSeconds}
 SET ${patchKeys.map((c) => `${c} = :${c}`).join(', ')}
-WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
+WHERE ${effectivePk.map((k) => `${k} = :${k}`).join(' AND ')};
 `;
 
 		const params: CassandraParams = {};
@@ -1647,7 +1689,7 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 			ttlSeconds,
 		};
 
-		return prepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
+		return tenantPrepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
 	}
 
 	function patchByPkWithTtlParam(
@@ -1665,7 +1707,7 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 
 		const cql = `UPDATE ${def.name} USING TTL :${ttlParamName}
 SET ${patchKeys.map((c) => `${c} = :${c}`).join(', ')}
-WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
+WHERE ${effectivePk.map((k) => `${k} = :${k}`).join(' AND ')};
 `;
 
 		const params: CassandraParams = {};
@@ -1682,7 +1724,7 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 			ttlParamName,
 		};
 
-		return prepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
+		return tenantPrepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
 	}
 
 	function upsertAllWithTtl(row: Row, ttlSeconds: number): PreparedQuery {
@@ -1690,12 +1732,12 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 			nonPkColumns.length > 0
 				? `UPDATE ${def.name} USING TTL ${ttlSeconds}
 SET ${nonPkColumns.map((c) => `${c} = :${c}`).join(', ')}
-WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
+WHERE ${effectivePk.map((k) => `${k} = :${k}`).join(' AND ')};
 `
-				: `INSERT INTO ${def.name} (${columns.join(', ')}) VALUES (${columns.map((c) => `:${c}`).join(', ')}) USING TTL ${ttlSeconds};`;
+				: `INSERT INTO ${def.name} (${insertColumns.join(', ')}) VALUES (${insertColumns.map((c) => `:${c}`).join(', ')}) USING TTL ${ttlSeconds};`;
 		const params = paramsFromRow(row);
 		const kvMeta: KvQueryMeta<Row> = {action: 'upsert', table: tableSpec, ttlSeconds};
-		return prepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
+		return tenantPrepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
 	}
 
 	function upsertAllWithTtlParam(row: Row, ttlParamName: string, ttlValue: number): PreparedQuery {
@@ -1703,13 +1745,13 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 			nonPkColumns.length > 0
 				? `UPDATE ${def.name} USING TTL :${ttlParamName}
 SET ${nonPkColumns.map((c) => `${c} = :${c}`).join(', ')}
-WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
+WHERE ${effectivePk.map((k) => `${k} = :${k}`).join(' AND ')};
 `
-				: `INSERT INTO ${def.name} (${columns.join(', ')}) VALUES (${columns.map((c) => `:${c}`).join(', ')}) USING TTL :${ttlParamName};`;
+				: `INSERT INTO ${def.name} (${insertColumns.join(', ')}) VALUES (${insertColumns.map((c) => `:${c}`).join(', ')}) USING TTL :${ttlParamName};`;
 		const params = paramsFromRow(row);
 		params[ttlParamName] = ttlValue;
 		const kvMeta: KvQueryMeta<Row> = {action: 'upsert', table: tableSpec, ttlParamName};
-		return prepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
+		return tenantPrepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
 	}
 
 	function patchByPkIf<CondCol extends Exclude<ColumnName<Row>, PK>>(
@@ -1726,7 +1768,7 @@ WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')};
 
 		const cql = `UPDATE ${def.name}
 SET ${patchKeys.map((c) => `${c} = :${c}`).join(', ')}
-WHERE ${pk.map((k) => `${k} = :${k}`).join(' AND ')}
+WHERE ${effectivePk.map((k) => `${k} = :${k}`).join(' AND ')}
 IF ${condition.col} = :${condition.expectedParam};
 `;
 
@@ -1748,7 +1790,7 @@ IF ${condition.col} = :${condition.expectedParam};
 			},
 		};
 
-		return prepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
+		return tenantPrepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
 	}
 
 	return {
@@ -1770,11 +1812,11 @@ IF ${condition.col} = :${condition.expectedParam};
 			const hasAllColumns = columns.every((c) => row[c as keyof Row] !== undefined);
 			const kvMeta: KvQueryMeta<Row> = {action: 'upsert', table: tableSpec};
 			if (hasAllColumns) {
-				return prepared(updateAll, paramsFromRow(row), kvMeta as KvQueryMeta<Record<string, unknown>>);
+				return tenantPrepared(updateAll, paramsFromRow(row), kvMeta as KvQueryMeta<Record<string, unknown>>);
 			}
 			const {cql, params} = buildDynamicUpsertCql(row);
 			registerKvMeta(cql, kvMeta as KvQueryMeta<Record<string, unknown>>);
-			return prepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
+			return tenantPrepared(cql, params, kvMeta as KvQueryMeta<Record<string, unknown>>);
 		},
 
 		patchByPk,
@@ -1808,7 +1850,11 @@ IF ${condition.col} = :${condition.expectedParam};
 			gt: (col, param) => ({kind: 'gt', col, param: param ?? col}),
 			lte: (col, param) => ({kind: 'lte', col, param: param ?? col}),
 			gte: (col, param) => ({kind: 'gte', col, param: param ?? col}),
-			tokenGt: (col, param) => ({kind: 'tokenGt', col, param}),
+			tokenGt: (col, param) =>
+				isTenantScoped
+					? ({kind: 'tokenGtMulti', cols: ['tenant_id', col as string], params: ['tenant_id', param]} as WhereExpr<Row>)
+					: ({kind: 'tokenGt', col, param} as WhereExpr<Row>),
+			tokenGtMulti: (cols, params) => ({kind: 'tokenGtMulti', cols, params} as WhereExpr<Row>),
 			tupleGt: (cols, params) => ({kind: 'tupleGt', cols, params}),
 		},
 	};

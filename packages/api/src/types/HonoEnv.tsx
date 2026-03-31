@@ -26,7 +26,7 @@ import type {AuthService} from '@fluxer/api/src/auth/AuthService';
 import type {AuthMfaService} from '@fluxer/api/src/auth/services/AuthMfaService';
 import type {DesktopHandoffService} from '@fluxer/api/src/auth/services/DesktopHandoffService';
 import type {SsoService} from '@fluxer/api/src/auth/services/SsoService';
-import type {UserID} from '@fluxer/api/src/BrandedTypes';
+import type {TenantID, UserID} from '@fluxer/api/src/BrandedTypes';
 import type {IBlueskyOAuthService} from '@fluxer/api/src/bluesky/IBlueskyOAuthService';
 import type {IChannelRepository} from '@fluxer/api/src/channel/IChannelRepository';
 import type {ChannelRequestService} from '@fluxer/api/src/channel/services/ChannelRequestService';
@@ -105,6 +105,7 @@ import type {Hono} from 'hono';
 
 export interface HonoEnv {
 	Variables: {
+		tenantId: TenantID;
 		user: User;
 		responseSchema: unknown;
 		adminService: AdminService;

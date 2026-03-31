@@ -23,6 +23,7 @@ import {ConcurrencyLimitMiddleware} from '@fluxer/api/src/middleware/Concurrency
 import {GuildAvailabilityMiddleware} from '@fluxer/api/src/middleware/GuildAvailabilityMiddleware';
 import {IpBanMiddleware} from '@fluxer/api/src/middleware/IpBanMiddleware';
 import {LocaleMiddleware} from '@fluxer/api/src/middleware/LocaleMiddleware';
+import {TenantMiddleware} from '@fluxer/api/src/middleware/TenantMiddleware';
 import {MetricsMiddleware} from '@fluxer/api/src/middleware/MetricsMiddleware';
 import {RequestCacheMiddleware} from '@fluxer/api/src/middleware/RequestCacheMiddleware';
 import {RequireXForwardedForMiddleware} from '@fluxer/api/src/middleware/RequireXForwardedForMiddleware';
@@ -104,6 +105,7 @@ export function configureMiddleware(routes: HonoApp, options: MiddlewarePipeline
 	}
 
 	routes.use(IpBanMiddleware);
+	routes.use(TenantMiddleware);
 	routes.use(ConcurrencyLimitMiddleware);
 	routes.use(MetricsMiddleware);
 	routes.use(AuditLogMiddleware);
